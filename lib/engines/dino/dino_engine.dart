@@ -16,21 +16,26 @@ import 'package:image/image.dart' as img;
 const int dinoSize = 224;
 const int dinoDim = 960;
 const String dinoAsset = 'assets/models/mobilenet.onnx';
+const String dinoV2Asset = 'assets/models/dinov2-small.onnx';
+const int dinoV2Dim = 384;
 
 const _mean = [0.485, 0.456, 0.406];
 const _std = [0.229, 0.224, 0.225];
 
 final List<Float32List> _lut = [
   for (var c = 0; c < 3; c++)
-    Float32List.fromList(
-        [for (var v = 0; v < 256; v++) (v / 255.0 - _mean[c]) / _std[c]]),
+    Float32List.fromList([
+      for (var v = 0; v < 256; v++) (v / 255.0 - _mean[c]) / _std[c],
+    ]),
 ];
 
 /// Ảnh JPEG/PNG bytes -> tensor NCHW (3*224*224) hoặc null nếu không giải mã được.
 Float32List? dinoPreprocess(Uint8List bytes) {
   final decoded = img.decodeImage(bytes);
   if (decoded == null) return null;
-  final rgb = decoded.numChannels == 3 ? decoded : decoded.convert(numChannels: 3);
+  final rgb = decoded.numChannels == 3
+      ? decoded
+      : decoded.convert(numChannels: 3);
   final small = (rgb.width == dinoSize && rgb.height == dinoSize)
       ? rgb
       : img.copyResize(
@@ -69,10 +74,12 @@ Float32List? dinoPreprocess(Uint8List bytes) {
 
 /// Tiền xử lý cả batch trong isolate riêng; phần tử null nếu ảnh lỗi/thiếu.
 Future<List<Float32List?>> dinoPreprocessBatch(List<Uint8List?> thumbs) =>
-    Isolate.run(() => [
-          for (final t in thumbs)
-            if (t == null) null else _safePreprocess(t)
-        ]);
+    Isolate.run(
+      () => [
+        for (final t in thumbs)
+          if (t == null) null else _safePreprocess(t),
+      ],
+    );
 
 Float32List? _safePreprocess(Uint8List t) {
   try {
@@ -83,6 +90,9 @@ Float32List? _safePreprocess(Uint8List t) {
 }
 
 class DinoEmbedder {
+  DinoEmbedder({this.useDinoV2 = false});
+
+  final bool useDinoV2;
   OrtSession? _session;
   String _inName = '';
   String _outName = '';
@@ -92,7 +102,9 @@ class DinoEmbedder {
   /// Ném lỗi nếu thiếu file model hoặc không khởi tạo được ONNX Runtime.
   Future<void> load() async {
     final ort = OnnxRuntime();
-    final s = await ort.createSessionFromAsset(dinoAsset);
+    final s = await ort.createSessionFromAsset(
+      useDinoV2 ? dinoV2Asset : dinoAsset,
+    );
     _session = s;
     _inName = s.inputNames.first;
     _outName = s.outputNames.first;
@@ -109,21 +121,29 @@ class DinoEmbedder {
     for (var i = 0; i < b; i++) {
       flat.setRange(i * per, (i + 1) * per, inputs[i]);
     }
-    final tensor =
-        await OrtValue.fromList(flat, [b, 3, dinoSize, dinoSize]);
+    final tensor = await OrtValue.fromList(flat, [b, 3, dinoSize, dinoSize]);
     Map<String, OrtValue>? outs;
     try {
       outs = await s.run({_inName: tensor});
       final raw = await outs[_outName]!.asList();
+      if (useDinoV2) {
+        return dinoV2ClassEmbeddings(raw, b);
+      }
       final values = <double>[];
       _flatten(raw, values);
       if (values.length != b * dinoDim) {
-        throw StateError('Đầu ra DINO có ${values.length} giá trị, '
-            'kỳ vọng ${b * dinoDim} (batch $b x $dinoDim)');
+        throw StateError(
+          'Đầu ra DINO có ${values.length} giá trị, '
+          'kỳ vọng ${b * dinoDim} (batch $b x $dinoDim)',
+        );
       }
       return [
         for (var i = 0; i < b; i++)
-          _l2(Float32List.fromList(values.sublist(i * dinoDim, (i + 1) * dinoDim)))
+          _l2(
+            Float32List.fromList(
+              values.sublist(i * dinoDim, (i + 1) * dinoDim),
+            ),
+          ),
       ];
     } finally {
       await tensor.dispose();
@@ -140,6 +160,27 @@ class DinoEmbedder {
     _session = null;
     if (s != null) await s.close();
   }
+}
+
+/// Extracts the class token from each image's sequence of DINOv2 tokens.
+List<Float32List> dinoV2ClassEmbeddings(dynamic raw, int batchSize) {
+  if (raw is! List || raw.length != batchSize) {
+    throw StateError('DINOv2 output has an unexpected batch shape');
+  }
+  final result = <Float32List>[];
+  for (final sample in raw) {
+    if (sample is! List || sample.isEmpty || sample.first is! List) {
+      throw StateError('DINOv2 output has an unexpected token shape');
+    }
+    final token = sample.first as List;
+    if (token.length != dinoV2Dim || token.any((x) => x is! num)) {
+      throw StateError('DINOv2 class token has an unexpected dimension');
+    }
+    result.add(
+      _l2(Float32List.fromList([for (final x in token) (x as num).toDouble()])),
+    );
+  }
+  return result;
 }
 
 void _flatten(dynamic x, List<double> out) {

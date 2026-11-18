@@ -43,12 +43,22 @@ void main() {
       final report = _run([
         _pair('A', 'B', 'a1', 'b1'),
         _pair('A', 'B', 'a2', 'b2'),
+        _pair('A', 'B', 'a2', 'b3'),
       ]);
       expect(report, contains('Near-duplicate: PASS'));
-      expect(report, contains('2 cặp đạt'));
+      expect(report, contains('3 cặp đạt'));
       expect(report, contains('chỉ đọc, không tự gộp'));
     },
   );
+
+  test('two independent pairs cannot leave the smaller group uncovered', () {
+    final report = _run([
+      _pair('A', 'B', 'a1', 'b1'),
+      _pair('A', 'B', 'a2', 'b2'),
+    ]);
+    expect(report, contains('Near-duplicate: FAIL'));
+    expect(report, contains('Burst-like: FAIL'));
+  });
 
   // Synthetic feature measurements only; these labels do not represent the
   // user's original assets, which have not been supplied to the workspace.
@@ -57,6 +67,7 @@ void main() {
       [
         _pair('Nhóm 3', 'Nhóm 4', 'g3-1', 'g4-1'),
         _pair('Nhóm 3', 'Nhóm 4', 'g3-2', 'g4-2'),
+        _pair('Nhóm 3', 'Nhóm 4', 'g3-2', 'g4-3'),
       ],
       sizes: const {'Nhóm 3': 6, 'Nhóm 4': 3},
     );
@@ -103,6 +114,7 @@ void main() {
     final report = _run([
       _pair('A', 'B', 'a1', 'b1', h: 90, gap: 900),
       _pair('A', 'B', 'a2', 'b2', h: 100, gap: 14000),
+      _pair('A', 'B', 'a2', 'b3', h: 100, gap: 15000),
     ]);
     expect(report, contains('Near-duplicate: FAIL'));
     expect(report, contains('Burst-like: PASS'));

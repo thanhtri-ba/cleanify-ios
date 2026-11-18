@@ -13,6 +13,7 @@ import '../../engines/lsh/candidate_index.dart';
 import '../../engines/pdq/pdq_engine.dart';
 import '../platform/photo_edits.dart';
 import 'active_clock.dart';
+import 'core_v2.dart';
 import 'cross_group_reconcile.dart';
 import 'hash_worker.dart';
 import 'regroup.dart';
@@ -190,7 +191,12 @@ class ScanConfig {
 }
 
 class ScanOrchestrator {
-  ScanOrchestrator({this.config = const ScanConfig()});
+  ScanOrchestrator({this.config = const ScanConfig(), CoreMode? coreMode})
+    : coreMode =
+          coreMode ??
+          CoreMode.parse(const String.fromEnvironment('CLEANIFY_CORE'));
+
+  final CoreMode coreMode;
 
   final ScanConfig config;
 
@@ -214,6 +220,7 @@ class ScanOrchestrator {
     ActiveClock? clock,
     ScanMode mode = const ScanMode(),
   }) async {
+    var usingV2 = false;
     // Luôn chạy bước trùng (PDQ/SHA) để ảnh trùng không lọt vào "tương tự";
     // nhóm trùng chỉ được GIỮ LẠI trong kết quả nếu người dùng chọn.
     final wantDup = mode.duplicates;
@@ -759,9 +766,56 @@ class ScanOrchestrator {
       // Gộp có điều kiện các nhóm trùng bị tách (luật hai chiều, không nối qua ảnh trung gian).
       _reconcileGroups(assets, groups, edges, shas, flat, has, emb, mark);
 
+      if (mode.duplicates &&
+          (coreMode == CoreMode.v2Active || coreMode == CoreMode.v2Shadow)) {
+        // V2 needs a comparable embedding for every scanned asset before
+        // it can replace the V1 snapshot. Shadow mode can measure partial input.
+        final canPublish =
+            coreMode == CoreMode.v2Active &&
+            session.incompleteStages.isEmpty &&
+            simEmb.length == assets.length;
+        try {
+          final candidate = _buildV2Duplicates(
+            session,
+            assets,
+            byRoot.values,
+            shas,
+            flat,
+            has,
+            emb,
+            simEmb,
+            recordDiagnostics: canPublish,
+          );
+          if (candidate == null) {
+            mark('Core V2: hết giới hạn xác minh, dùng kết quả V1');
+          } else {
+            mark(
+              'Core V2: V1 ${groups.length} nhóm, V2 ${candidate.length} nhóm',
+            );
+            if (coreMode == CoreMode.v2Active && !canPublish) {
+              mark('Core V2: embedding chưa đầy đủ, giữ kết quả V1');
+            }
+            if (canPublish) {
+              usingV2 = true;
+              groups
+                ..clear()
+                ..addAll(candidate);
+              inDupIds
+                ..clear()
+                ..addAll(
+                  candidate.expand((g) => g.items.map((i) => i.asset.id)),
+                );
+            }
+          }
+        } catch (e) {
+          mark('Core V2: lỗi phân nhóm, dùng kết quả V1 ($e)');
+        }
+      }
+
       // Nhóm theo thời gian: ảnh chụp liên tiếp trong một khoảng ngắn là một nhóm.
       // Đặt trước _Pending để nhánh AI nền không làm mất các nhóm này.
-      for (final g in _timeClusters(assets, inDupIds)) {
+      for (final g
+          in usingV2 ? <DuplicateGroup>[] : _timeClusters(assets, inDupIds)) {
         groups.add(g);
         inDupIds.addAll(g.items.map((e) => e.asset.id));
       }
@@ -776,6 +830,7 @@ class ScanOrchestrator {
         emb: emb,
         inDupIds: inDupIds,
         dupGroups: List.of(groups),
+        usingV2: usingV2,
       );
       // Không chọn "tương tự": chưa dựng nhóm tương tự; người dùng có thể chạy AI sau.
       final similar = mode.similar
@@ -785,7 +840,7 @@ class ScanOrchestrator {
               mark,
             )
           : <DuplicateGroup>[];
-      if (wantDup && mode.similar) {
+      if (wantDup && mode.similar && !usingV2) {
         _mergeSeries(groups, similar, assets, simEmb, mark);
       }
       _pending = config.useSimilarModel && !mode.similar && wantDup
@@ -793,10 +848,35 @@ class ScanOrchestrator {
           : null;
       if (!wantDup) groups.clear();
       groups.addAll(similar);
+      if (coreMode == CoreMode.v2Shadow && assets.isNotEmpty) {
+        // Keep experimental DINOv2 features separate from V1's cache.
+        final features = await _embedIndices(
+          session,
+          assets,
+          List.generate(assets.length, (i) => i),
+          (_) {},
+          mark,
+          progressTotal: assets.length,
+          timeBudget: config.similarTimeBudget,
+          useDinoV2: true,
+        );
+        mark('DINOv2 thử nghiệm: ${features.length}/${assets.length} ảnh');
+        if (features.length <= 2000) {
+          final screenshots = [
+            for (final asset in assets) isScreenshotAsset(asset),
+          ];
+          final candidates = await Isolate.run(
+            () => findDinoCandidates(features, screenshots),
+          );
+          mark('DINOv2 thử nghiệm: ${candidates.length} cặp ứng viên');
+        } else {
+          mark('DINOv2 thử nghiệm: bỏ qua tìm cặp vì vượt giới hạn');
+        }
+      }
       session.groups
         ..clear()
         ..addAll(groups);
-      session.pdqIndex = wantDup
+      session.pdqIndex = wantDup && !usingV2
           ? PdqIndex(
               assets: assets,
               shas: shas,
@@ -815,6 +895,69 @@ class ScanOrchestrator {
         await PhotoManager.clearFileCache();
       } catch (_) {}
     }
+  }
+
+  List<DuplicateGroup>? _buildV2Duplicates(
+    ScanSession session,
+    List<AssetEntity> assets,
+    Iterable<List<int>> components,
+    List<String?> shas,
+    Uint64List flat,
+    Uint8List has,
+    Map<int, Float32List> emb,
+    Map<int, Float32List> simEmb, {
+    required bool recordDiagnostics,
+  }) {
+    final partitions = <List<int>>[];
+    var remainingChecks = 50000;
+    for (final component in components) {
+      if (component.length < 2) continue;
+      for (final members in _splitByCapture(assets, component)) {
+        members.sort((a, b) => _byRepRank(assets, a, b));
+        final bySha = <String, List<int>>{};
+        for (final member in members) {
+          final sha = shas[member];
+          if (sha != null) (bySha[sha] ??= []).add(member);
+        }
+        final exact = bySha.values.where((group) => group.length > 1);
+        partitions.addAll(exact);
+        final exactMembers = exact.expand((group) => group).toSet();
+        final near = members.where((i) => !exactMembers.contains(i)).toList();
+        final result = partitionConfirmed(near, (a, b) {
+          remainingChecks--;
+          final cosine =
+              cosineOf(simEmb[a], simEmb[b]) ?? cosineOf(emb[a], emb[b]);
+          return verifyNearPair(
+            sameCaptureType: true,
+            hamming: _hamming(flat, has, a, b),
+            cosine: cosine,
+            maxHamming: config.maxHamming,
+            candidateHamming: config.similarMaxHamming,
+            minCosine: config.modelMinCosine,
+          );
+        }, maxChecks: remainingChecks);
+        if (result.exhausted) return null;
+        partitions.addAll(result.groups.where((group) => group.length > 1));
+      }
+    }
+    final result = <DuplicateGroup>[];
+    for (final members in partitions) {
+      final group = _buildGroup(
+        session,
+        assets,
+        members,
+        shas,
+        flat,
+        has,
+        emb,
+        GroupKind.duplicate,
+        config.maxHamming,
+        recordDiagnostics: recordDiagnostics,
+      );
+      if (group != null) result.add(group);
+    }
+    result.sort((a, b) => b.items.length.compareTo(a.items.length));
+    return result;
   }
 
   /// Khi đã có embedding AI: ảnh (không phải SHA giống hệt) trong nhóm trùng mà cosine với
@@ -1054,15 +1197,17 @@ class ScanOrchestrator {
         g.items.removeWhere((e) => !live.contains(e.asset.id));
       }
       similar.removeWhere((g) => g.items.length < 2);
-      _mergeSeries(
-        p.dupGroups
-            .where((g) => g.items.length > 1 && g.kind == GroupKind.duplicate)
-            .toList(),
-        similar,
-        p.assets,
-        simEmb,
-        mark,
-      );
+      if (!p.usingV2) {
+        _mergeSeries(
+          p.dupGroups
+              .where((g) => g.items.length > 1 && g.kind == GroupKind.duplicate)
+              .toList(),
+          similar,
+          p.assets,
+          simEmb,
+          mark,
+        );
+      }
       session.groups
         ..clear()
         ..addAll(p.dupGroups.where((g) => g.items.length > 1))
@@ -1098,6 +1243,7 @@ class ScanOrchestrator {
     Map<int, int> links = const {},
     Map<int, Float32List> simEmb = const {},
     bool chain = false,
+    bool recordDiagnostics = true,
   }) {
     final n = assets.length;
     double? simCos(int m) => kind == GroupKind.similar
@@ -1167,7 +1313,7 @@ class ScanOrchestrator {
           pdqHamming: simH,
         ),
       );
-      if (session.diag != null) {
+      if (recordDiagnostics && session.diag != null) {
         rows.add(
           _dupRow(
             assets[m],
@@ -1185,7 +1331,7 @@ class ScanOrchestrator {
       }
     }
     final group = DuplicateGroup(items, kind: kind);
-    session.diag?.attach(group, rows);
+    if (recordDiagnostics) session.diag?.attach(group, rows);
     return group;
   }
 
@@ -1597,8 +1743,9 @@ class ScanOrchestrator {
     int progressOffset = 0,
     int? progressTotal,
     Duration? timeBudget,
+    bool useDinoV2 = false,
   }) async {
-    final embedder = DinoEmbedder();
+    final embedder = DinoEmbedder(useDinoV2: useDinoV2);
     try {
       await embedder.load();
     } catch (e) {
@@ -1748,8 +1895,10 @@ class ScanOrchestrator {
           'AI: dừng theo giới hạn ${timeBudget!.inSeconds}s; '
           'đã xử lý $done/${todo.length}, còn $remaining ảnh',
         );
-        session.incompleteStages.add('Ảnh tương tự');
-        session.remainingForStage['Ảnh tương tự'] = remaining;
+        if (!useDinoV2) {
+          session.incompleteStages.add('Ảnh tương tự');
+          session.remainingForStage['Ảnh tương tự'] = remaining;
+        }
       }
       mark(
         'AI: lấy thumbnail ${(thumbMs / 1000).round()}s, giải mã+chuẩn hóa '
@@ -2223,6 +2372,7 @@ class _Pending {
     required this.emb,
     required this.inDupIds,
     required this.dupGroups,
+    required this.usingV2,
   });
   final List<AssetEntity> assets;
   final List<String?> shas;
@@ -2234,6 +2384,7 @@ class _Pending {
   final Map<int, Float32List> emb;
   final Set<String> inDupIds;
   final List<DuplicateGroup> dupGroups;
+  final bool usingV2;
 }
 
 class _OrigHashes {
